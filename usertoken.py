@@ -1,25 +1,23 @@
 import uuid
-from CTFd.utils import config, email, get_app_config, get_config
-from CTFd.utils.config import is_teams_mode
-from CTFd.utils.logging import log
+
 from flask import current_app as app
-from flask import redirect, render_template, request, send_file, session, url_for
+from flask import redirect, render_template, request, url_for
+
 from CTFd.models import (
-    Admins,
-    Files,
-    Notifications,
-    Pages,
-    Teams,
     Users,
     UserTokens,
     db,
 )
-from CTFd.utils import config, get_config, set_config
+from CTFd.utils import config, get_config
+from CTFd.utils import email
 from CTFd.utils import validators
-from CTFd.utils.helpers import get_errors, get_infos
-from CTFd.utils.security.auth import login_user
-from CTFd.utils.user import authed, get_current_user, is_admin
+from CTFd.utils.config import is_teams_mode
 from CTFd.utils.decorators import authed_only
+from CTFd.utils.helpers import get_errors, get_infos, markup
+from CTFd.utils.logging import log
+from CTFd.utils.security.auth import login_user
+from CTFd.utils.user import get_current_user
+from CTFd.utils.validators import ValidationError
 
 
 def register():
@@ -30,17 +28,40 @@ def register():
         password = request.form.get("password", "").strip()
         secret = str(uuid.uuid4())
 
+        website = request.form.get("website")
+        affiliation = request.form.get("affiliation")
+        country = request.form.get("country")
+
         name_len = len(name) == 0
         names = Users.query.add_columns("name", "id").filter_by(name=name).first()
         emails = (
             Users.query.add_columns("email", "id")
-                .filter_by(email=email_address)
-                .first()
+            .filter_by(email=email_address)
+            .first()
         )
         pass_short = len(password) == 0
         pass_long = len(password) > 128
         valid_email = validators.validate_email(email_address)
         team_name_email_check = validators.validate_email(name)
+
+        if country:
+            try:
+                validators.validate_country_code(country)
+                valid_country = True
+            except ValidationError:
+                valid_country = False
+        else:
+            valid_country = True
+
+        if website:
+            valid_website = validators.validate_url(website)
+        else:
+            valid_website = True
+
+        if affiliation:
+            valid_affiliation = len(affiliation) < 128
+        else:
+            valid_affiliation = True
 
         if not valid_email:
             errors.append("Please enter a valid email address")
@@ -62,6 +83,12 @@ def register():
             errors.append("Pick a shorter password")
         if name_len:
             errors.append("Pick a longer user name")
+        if valid_website is False:
+            errors.append("Websites must be a proper URL starting with http or https")
+        if valid_country is False:
+            errors.append("Invalid country")
+        if valid_affiliation is False:
+            errors.append("Please provide a shorter affiliation")
 
         if len(errors) > 0:
             return render_template(
@@ -74,6 +101,14 @@ def register():
         else:
             with app.app_context():
                 user = Users(name=name, email=email_address, password=password, secret=secret)
+
+                if website:
+                    user.website = website
+                if affiliation:
+                    user.affiliation = affiliation
+                if country:
+                    user.country = country
+
                 db.session.add(user)
                 db.session.commit()
                 db.session.flush()
@@ -81,7 +116,7 @@ def register():
                 login_user(user)
 
                 if config.can_send_mail() and get_config(
-                        "verify_emails"
+                    "verify_emails"
                 ):  # Confirming users is enabled and we can send email.
                     log(
                         "registrations",
@@ -92,7 +127,7 @@ def register():
                     return redirect(url_for("auth.confirm"))
                 else:  # Don't care about confirming users
                     if (
-                            config.can_send_mail()
+                        config.can_send_mail()
                     ):  # We want to notify the user that they have registered.
                         email.successful_registration_notification(user.email)
 
@@ -108,6 +143,8 @@ def register():
 
 @authed_only
 def settings():
+    infos = get_infos()
+
     user = get_current_user()
     name = user.name
     email = user.email
@@ -119,7 +156,17 @@ def settings():
     tokens = UserTokens.query.filter_by(user_id=user.id).all()
 
     prevent_name_change = get_config("prevent_name_change")
-    confirm_email = get_config("verify_emails") and not user.verified
+
+    if get_config("verify_emails") and not user.verified:
+        confirm_url = markup(url_for("auth.confirm"))
+        infos.append(
+            markup(
+                "Your email address isn't confirmed!<br>"
+                "Please check your email to confirm your email address.<br><br>"
+                f'To have the confirmation email resent please <a href="{confirm_url}">click here</a>.'
+            )
+        )
+
     return render_template(
         "ctfd-usertoken/usertoken_settings.html",
         name=name,
@@ -129,6 +176,6 @@ def settings():
         country=country,
         tokens=tokens,
         prevent_name_change=prevent_name_change,
-        confirm_email=confirm_email,
+        infos=infos,
         secret=secret,
     )
