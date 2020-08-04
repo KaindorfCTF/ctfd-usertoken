@@ -25,6 +25,7 @@ from CTFd.utils.decorators.visibility import (
 )
 from CTFd.utils.user import get_current_user, get_current_user_type, is_admin
 
+
 def load(app):
     blueprint = Blueprint("usertoken", __name__, template_folder="templates")
 
@@ -32,18 +33,21 @@ def load(app):
     @admins_only
     @check_account_visibility
     def verify(secret):
-        user = Users.query.filter_by(secret=secret).first_or_404()
+        user = Users.query.filter_by(secret=secret).first()
+
+        if user is None:
+            return {"success": False}
 
         if (user.banned or user.hidden) and is_admin() is False:
-            abort(404)
+            return {"success": False}
 
         user_type = get_current_user_type(fallback="user")
         response = UserSchema(view=user_type).dump(user)
 
         if response.errors:
-            return {"success": False, "errors": response.errors}, 400
+            return {"success": False, "errors": response.errors}
 
-        return {"success": True}
+        return {"success": True, "username": response.data["name"]}
 
     app.register_blueprint(blueprint)
     app.view_functions["auth.register"] = register
