@@ -1,27 +1,44 @@
 import uuid
+import base64
 
+import requests
+from flask import Blueprint
 from flask import current_app as app
-from flask import redirect, render_template, request, url_for
+from flask import redirect, render_template, request, session, url_for
+from itsdangerous.exc import BadSignature, BadTimeSignature, SignatureExpired
 
 from CTFd.models import (
     Users,
     UserTokens,
     db,
 )
-from CTFd.utils import config, get_config
-from CTFd.utils import email
+
+from CTFd.cache import clear_team_session, clear_user_session
+from CTFd.models import Teams, UserFieldEntries, UserFields, Users, db
+from CTFd.utils import config, email, get_app_config, get_config
+from CTFd.utils import user as current_user
 from CTFd.utils import validators
 from CTFd.utils.config import is_teams_mode
-from CTFd.utils.decorators import authed_only
-from CTFd.utils.helpers import get_errors, get_infos, markup
+from CTFd.utils.config.integrations import mlc_registration
+from CTFd.utils.config.visibility import registration_visible
+from CTFd.utils.crypto import verify_password
+from CTFd.utils.decorators import ratelimit
+from CTFd.utils.decorators.visibility import check_registration_visibility
+from CTFd.utils.helpers import error_for, get_errors, markup
 from CTFd.utils.logging import log
-from CTFd.utils.security.auth import login_user
-from CTFd.utils.user import get_current_user
+from CTFd.utils.modes import TEAMS_MODE
+from CTFd.utils.security.auth import login_user, logout_user
+from CTFd.utils.security.signing import unserialize
 from CTFd.utils.validators import ValidationError
+from CTFd.utils.decorators import authed_only
 
-
+@check_registration_visibility
+@ratelimit(method="POST", limit=10, interval=5)
 def register():
     errors = get_errors()
+    if current_user.authed():
+        return redirect(url_for("challenges.listing"))
+
     if request.method == "POST":
         name = request.form.get("name", "").strip()
         email_address = request.form.get("email", "").strip().lower()
@@ -43,6 +60,31 @@ def register():
         pass_long = len(password) > 128
         valid_email = validators.validate_email(email_address)
         team_name_email_check = validators.validate_email(name)
+
+        # Process additional user fields
+        fields = {}
+        for field in UserFields.query.all():
+            fields[field.id] = field
+
+        entries = {}
+        for field_id, field in fields.items():
+            value = request.form.get(f"fields[{field_id}]", "").strip()
+            if field.required is True and (value is None or value == ""):
+                errors.append("Please provide all required fields")
+                break
+
+            # Handle special casing of existing profile fields
+            if field.name.lower() == "affiliation":
+                affiliation = value
+                break
+            elif field.name.lower() == "website":
+                website = value
+                break
+
+            if field.field_type == "boolean":
+                entries[field_id] = bool(value)
+            else:
+                entries[field_id] = value
 
         if country:
             try:
@@ -113,7 +155,19 @@ def register():
                 db.session.commit()
                 db.session.flush()
 
+                for field_id, value in entries.items():
+                    entry = UserFieldEntries(
+                        field_id=field_id, value=value, user_id=user.id
+                    )
+                    db.session.add(entry)
+                db.session.commit()
+
                 login_user(user)
+
+                if request.args.get("next") and validators.is_safe_url(
+                    request.args.get("next")
+                ):
+                    return redirect(request.args.get("next"))
 
                 if config.can_send_mail() and get_config(
                     "verify_emails"
@@ -121,6 +175,8 @@ def register():
                     log(
                         "registrations",
                         format="[{date}] {ip} - {name} registered (UNCONFIRMED) with {email}",
+                        name=user.name,
+                        email=user.email,
                     )
                     email.verify_email_address(user.email)
                     db.session.close()
@@ -131,7 +187,12 @@ def register():
                     ):  # We want to notify the user that they have registered.
                         email.successful_registration_notification(user.email)
 
-        log("registrations", "[{date}] {ip} - {name} registered with {email}")
+        log(
+            "registrations",
+            format="[{date}] {ip} - {name} registered with {email}",
+            name=user.name,
+            email=user.email,
+        )
         db.session.close()
 
         if is_teams_mode():
